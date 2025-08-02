@@ -159,14 +159,29 @@ def generate_pdf_from_chat():
 
         content = data['content']
 
+        if not content.strip():
+            return jsonify({"error": "Content cannot be empty"}), 400
+
         # Generate PDF
         pdf = generate_pdf_from_text(content)
 
         # Save PDF to bytes buffer
         pdf_buffer = io.BytesIO()
-        pdf_output = pdf.output(dest='S').encode('latin-1')
+        pdf_output = pdf.output(dest='S')
+
+        # Convert to bytes if it's a string
+        if isinstance(pdf_output, str):
+            pdf_output = pdf_output.encode('latin-1')
+
+        if pdf_output is None:
+            return jsonify({"error": "Failed to generate PDF output"}), 500
+
         pdf_buffer.write(pdf_output)
         pdf_buffer.seek(0)
+
+        # Verify buffer has content
+        if pdf_buffer.getvalue() == b'':
+            return jsonify({"error": "Generated PDF is empty"}), 500
 
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -180,7 +195,7 @@ def generate_pdf_from_chat():
         )
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
 
 
 @app.route('/health', methods=['GET'])
