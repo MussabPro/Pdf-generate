@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, send_file
 from fpdf import FPDF
 import os
-import io
+
+import base64
 from datetime import datetime
 
 app = Flask(__name__)
@@ -165,8 +166,7 @@ def generate_pdf_from_chat():
         # Generate PDF
         pdf = generate_pdf_from_text(content)
 
-        # Save PDF to bytes buffer
-        pdf_buffer = io.BytesIO()
+        # Get PDF output as bytes
         pdf_output = pdf.output(dest='S')
 
         # Convert to bytes if it's a string
@@ -176,23 +176,24 @@ def generate_pdf_from_chat():
         if pdf_output is None:
             return jsonify({"error": "Failed to generate PDF output"}), 500
 
-        pdf_buffer.write(pdf_output)
-        pdf_buffer.seek(0)
-
-        # Verify buffer has content
-        if pdf_buffer.getvalue() == b'':
+        # Verify PDF has content
+        if pdf_output == b'':
             return jsonify({"error": "Generated PDF is empty"}), 500
+
+        # Convert to base64 for JSON response
+        pdf_base64 = base64.b64encode(pdf_output).decode('utf-8')
 
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"resource_{timestamp}.pdf"
 
-        return send_file(
-            pdf_buffer,
-            as_attachment=True,
-            download_name=filename,
-            mimetype='application/pdf'
-        )
+        return jsonify({
+            "success": True,
+            "pdf_data": pdf_base64,
+            "filename": filename,
+            "content_type": "application/pdf",
+            "size": len(pdf_output)
+        })
 
     except Exception as e:
         return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
