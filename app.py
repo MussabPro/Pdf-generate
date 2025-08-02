@@ -1,11 +1,97 @@
 from flask import Flask, request, jsonify, send_file
 from fpdf import FPDF
 import os
-
+import firebase_admin
+from firebase_admin import credentials, storage
+from dotenv import load_dotenv
 import base64
 from datetime import datetime
+import io
+import json
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
+
+# Initialize Firebase Admin SDK
+def initialize_firebase():
+    try:
+        # Check if Firebase is already initialized
+        firebase_admin.get_app()
+    except ValueError:
+        # Firebase not initialized, so initialize it
+        # Try to get service account from environment variable
+        service_account_json = os.getenv('FIREBASE_SERVICE_ACCOUNT')
+        if service_account_json:
+            # Parse JSON from environment variable
+            service_account_info = json.loads(service_account_json)
+            cred = credentials.Certificate(service_account_info)
+        else:
+            # Fallback to service account file path
+            service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH', 'firebase-service-account.json')
+            if os.path.exists(service_account_path):
+                cred = credentials.Certificate(service_account_path)
+            else:
+                raise FileNotFoundError("Firebase service account credentials not found")
+        
+        # Initialize with storage bucket
+        bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET')
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': bucket_name
+        })
+
+# Initialize Firebase on startup
+initialize_firebase()
+
+
+def upload_pdf_to_firebase(pdf_bytes, filename):
+    """Upload PDF bytes to Firebase Storage and return download URL"""
+    try:
+        # Get Firebase Storage bucket
+        bucket = storage.bucket()
+        
+        # Create blob with filename
+        blob = bucket.blob(f"pdfs/{filename}")
+        
+        # Upload PDF bytes
+        blob.upload_from_string(pdf_bytes, content_type='application/pdf')
+        
+        # Make the blob publicly accessible
+        blob.make_public()
+        
+        # Return the public URL
+        return blob.public_url
+        
+    except Exception as e:
+        raise Exception(f"Failed to upload PDF to Firebase: {str(e)}")
+
+
+def upload_pdf_to_firebase_secure(pdf_bytes, filename):
+    """Upload PDF bytes to Firebase Storage and return a signed URL (more secure)"""
+    try:
+        from datetime import timedelta
+        
+        # Get Firebase Storage bucket
+        bucket = storage.bucket()
+        
+        # Create blob with filename
+        blob = bucket.blob(f"pdfs/{filename}")
+        
+        # Upload PDF bytes
+        blob.upload_from_string(pdf_bytes, content_type='application/pdf')
+        
+        # Generate a signed URL that expires in 7 days
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(days=7),
+            method="GET"
+        )
+        
+        return url
+        
+    except Exception as e:
+        raise Exception(f"Failed to upload PDF to Firebase: {str(e)}")
 
 
 def clean_text_for_pdf(text):
@@ -101,7 +187,7 @@ def generate_pdf_from_text(content):
             # Add logo and header to new page
             pdf.set_y(30)
             try:
-                logo_path = '/Users/mussab/Desktop/Python/logo.png'
+                logo_path = 'static/logo.png'
                 if os.path.exists(logo_path):
                     pdf.image(logo_path, x=25, y=30, w=15, h=15)
                 else:
@@ -149,8 +235,9 @@ def generate_pdf_from_text(content):
 @app.route('/generate-pdf', methods=['POST'])
 def generate_pdf_from_chat():
     """
-    API endpoint to generate PDF from chatbot response
-    Expects JSON: {"content": "chatbot response text"}
+    API endpoint to generate PDF from chatbot response and upload to Firebase
+    Expects JSON: {"content": "chatbot response text", "secure": true/false (optional)}
+    Returns: {"success": true, "download_url": "firebase_url", "filename": "filename.pdf"}
     """
     try:
         data = request.get_json()
@@ -159,6 +246,7 @@ def generate_pdf_from_chat():
             return jsonify({"error": "Missing 'content' in request"}), 400
 
         content = data['content']
+        use_secure_url = data.get('secure', False)  # Optional parameter for secure URLs
 
         if not content.strip():
             return jsonify({"error": "Content cannot be empty"}), 400
@@ -180,19 +268,26 @@ def generate_pdf_from_chat():
         if pdf_output == b'':
             return jsonify({"error": "Generated PDF is empty"}), 500
 
-        # Convert to base64 for JSON response
-        pdf_base64 = base64.b64encode(pdf_output).decode('utf-8')
-
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"resource_{timestamp}.pdf"
 
+        # Upload to Firebase Storage
+        try:
+            if use_secure_url:
+                download_url = upload_pdf_to_firebase_secure(pdf_output, filename)
+            else:
+                download_url = upload_pdf_to_firebase(pdf_output, filename)
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload to Firebase: {str(e)}"}), 500
+
         return jsonify({
             "success": True,
-            "pdf_data": pdf_base64,
+            "download_url": download_url,
             "filename": filename,
             "content_type": "application/pdf",
-            "size": len(pdf_output)
+            "size": len(pdf_output),
+            "secure_url": use_secure_url
         })
 
     except Exception as e:
@@ -203,6 +298,72 @@ def generate_pdf_from_chat():
 def health_check():
     """Health check endpoint"""
     return jsonify({"status": "healthy", "service": "PDF Generation API"})
+
+
+@app.route('/generate-pdf-with-data', methods=['POST'])
+def generate_pdf_with_data():
+    """
+    API endpoint to generate PDF and return both Firebase URL and base64 data
+    Expects JSON: {"content": "chatbot response text", "secure": true/false (optional)}
+    Returns: {"success": true, "download_url": "firebase_url", "pdf_data": "base64_data", "filename": "filename.pdf"}
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'content' not in data:
+            return jsonify({"error": "Missing 'content' in request"}), 400
+
+        content = data['content']
+        use_secure_url = data.get('secure', False)
+
+        if not content.strip():
+            return jsonify({"error": "Content cannot be empty"}), 400
+
+        # Generate PDF
+        pdf = generate_pdf_from_text(content)
+
+        # Get PDF output as bytes
+        pdf_output = pdf.output(dest='S')
+
+        # Convert to bytes if it's a string
+        if isinstance(pdf_output, str):
+            pdf_output = pdf_output.encode('latin-1')
+
+        if pdf_output is None:
+            return jsonify({"error": "Failed to generate PDF output"}), 500
+
+        # Verify PDF has content
+        if pdf_output == b'':
+            return jsonify({"error": "Generated PDF is empty"}), 500
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"resource_{timestamp}.pdf"
+
+        # Upload to Firebase Storage
+        try:
+            if use_secure_url:
+                download_url = upload_pdf_to_firebase_secure(pdf_output, filename)
+            else:
+                download_url = upload_pdf_to_firebase(pdf_output, filename)
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload to Firebase: {str(e)}"}), 500
+
+        # Convert to base64 for JSON response
+        pdf_base64 = base64.b64encode(pdf_output).decode('utf-8')
+
+        return jsonify({
+            "success": True,
+            "download_url": download_url,
+            "pdf_data": pdf_base64,
+            "filename": filename,
+            "content_type": "application/pdf",
+            "size": len(pdf_output),
+            "secure_url": use_secure_url
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
 
 
 # For Vercel deployment

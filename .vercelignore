@@ -12,3 +12,5 @@ env/
 .env/
 .DS_Store
 *.log
+.env
+firebase-service-account.json
