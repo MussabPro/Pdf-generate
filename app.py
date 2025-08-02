@@ -32,11 +32,7 @@ def after_request(response):
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
-        response = jsonify()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
-        return response
+        return '', 204
 
 # Initialize Firebase Admin SDK
 
