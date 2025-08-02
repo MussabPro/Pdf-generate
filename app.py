@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
 from fpdf import FPDF
 import os
 import firebase_admin
@@ -14,7 +13,30 @@ import json
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Add CORS headers manually
+
+
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers',
+                         'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods',
+                         'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Handle CORS preflight requests
+
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "*")
+        response.headers.add('Access-Control-Allow-Methods', "*")
+        return response
 
 # Initialize Firebase Admin SDK
 
