@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 from fpdf import FPDF
 import os
 import firebase_admin
@@ -13,56 +14,98 @@ import json
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Initialize Firebase Admin SDK
+
+
 def initialize_firebase():
+    """Initialize Firebase Admin SDK"""
     try:
         # Check if Firebase is already initialized
         firebase_admin.get_app()
+        print("Firebase already initialized")
+        return True
     except ValueError:
         # Firebase not initialized, so initialize it
-        # Try to get service account from environment variable
-        service_account_json = os.getenv('FIREBASE_SERVICE_ACCOUNT')
-        if service_account_json:
-            # Parse JSON from environment variable
-            service_account_info = json.loads(service_account_json)
-            cred = credentials.Certificate(service_account_info)
-        else:
-            # Fallback to service account file path
-            service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH', 'firebase-service-account.json')
-            if os.path.exists(service_account_path):
-                cred = credentials.Certificate(service_account_path)
+        try:
+            # Try to get service account from environment variable
+            service_account_json = os.getenv('FIREBASE_SERVICE_ACCOUNT')
+            bucket_name = os.getenv(
+                'FIREBASE_STORAGE_BUCKET', 'gs://neurolight-6886f')
+
+            # Remove gs:// prefix if present
+            if bucket_name.startswith('gs://'):
+                bucket_name = bucket_name[5:]
+
+            print(f"Bucket name: {bucket_name}")
+            print(f"Firebase config present: {bool(service_account_json)}")
+
+            if service_account_json:
+                # Parse JSON from environment variable
+                service_account_info = json.loads(service_account_json)
+                cred = credentials.Certificate(service_account_info)
+                print(
+                    f"Using environment config for project: {service_account_info.get('project_id')}")
             else:
-                raise FileNotFoundError("Firebase service account credentials not found")
-        
-        # Initialize with storage bucket
-        bucket_name = os.getenv('FIREBASE_STORAGE_BUCKET')
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': bucket_name
-        })
+                # Fallback to service account file path
+                service_account_path = 'firebase-service-account.json'
+                if os.path.exists(service_account_path):
+                    cred = credentials.Certificate(service_account_path)
+                    print("Using local service account file")
+                else:
+                    print(
+                        "WARNING: Firebase credentials not found. Firebase features will be disabled.")
+                    return False
+
+            # Initialize with storage bucket - use default if not specified
+            if bucket_name:
+                firebase_admin.initialize_app(cred, {
+                    'storageBucket': bucket_name
+                })
+            else:
+                # Use default bucket
+                firebase_admin.initialize_app(cred)
+            print("Firebase initialized successfully")
+            return True
+
+        except Exception as e:
+            print(f"Firebase initialization error: {e}")
+            return False
+
 
 # Initialize Firebase on startup
-initialize_firebase()
+firebase_initialized = initialize_firebase()
 
 
 def upload_pdf_to_firebase(pdf_bytes, filename):
     """Upload PDF bytes to Firebase Storage and return download URL"""
     try:
+        # Ensure pdf_bytes is proper bytes object
+        if isinstance(pdf_bytes, bytearray):
+            pdf_bytes = bytes(pdf_bytes)
+        elif isinstance(pdf_bytes, str):
+            pdf_bytes = pdf_bytes.encode('latin-1')
+
         # Get Firebase Storage bucket
         bucket = storage.bucket()
-        
+
         # Create blob with filename
         blob = bucket.blob(f"pdfs/{filename}")
-        
-        # Upload PDF bytes
-        blob.upload_from_string(pdf_bytes, content_type='application/pdf')
-        
+
+        # Use BytesIO for upload instead of upload_from_string
+        from io import BytesIO
+        pdf_stream = BytesIO(pdf_bytes)
+
+        # Upload from stream
+        blob.upload_from_file(pdf_stream, content_type='application/pdf')
+
         # Make the blob publicly accessible
         blob.make_public()
-        
+
         # Return the public URL
         return blob.public_url
-        
+
     except Exception as e:
         raise Exception(f"Failed to upload PDF to Firebase: {str(e)}")
 
@@ -71,25 +114,35 @@ def upload_pdf_to_firebase_secure(pdf_bytes, filename):
     """Upload PDF bytes to Firebase Storage and return a signed URL (more secure)"""
     try:
         from datetime import timedelta
-        
+
+        # Ensure pdf_bytes is proper bytes object
+        if isinstance(pdf_bytes, bytearray):
+            pdf_bytes = bytes(pdf_bytes)
+        elif isinstance(pdf_bytes, str):
+            pdf_bytes = pdf_bytes.encode('latin-1')
+
         # Get Firebase Storage bucket
         bucket = storage.bucket()
-        
+
         # Create blob with filename
         blob = bucket.blob(f"pdfs/{filename}")
-        
-        # Upload PDF bytes
-        blob.upload_from_string(pdf_bytes, content_type='application/pdf')
-        
+
+        # Use BytesIO for upload instead of upload_from_string
+        from io import BytesIO
+        pdf_stream = BytesIO(pdf_bytes)
+
+        # Upload from stream
+        blob.upload_from_file(pdf_stream, content_type='application/pdf')
+
         # Generate a signed URL that expires in 7 days
         url = blob.generate_signed_url(
             version="v4",
             expiration=timedelta(days=7),
             method="GET"
         )
-        
+
         return url
-        
+
     except Exception as e:
         raise Exception(f"Failed to upload PDF to Firebase: {str(e)}")
 
@@ -246,7 +299,8 @@ def generate_pdf_from_chat():
             return jsonify({"error": "Missing 'content' in request"}), 400
 
         content = data['content']
-        use_secure_url = data.get('secure', False)  # Optional parameter for secure URLs
+        # Optional parameter for secure URLs
+        use_secure_url = data.get('secure', False)
 
         if not content.strip():
             return jsonify({"error": "Content cannot be empty"}), 400
@@ -254,44 +308,65 @@ def generate_pdf_from_chat():
         # Generate PDF
         pdf = generate_pdf_from_text(content)
 
-        # Get PDF output as bytes
+        # Get PDF output as bytes - fpdf2 returns bytearray, we need bytes
         pdf_output = pdf.output(dest='S')
 
-        # Convert to bytes if it's a string
-        if isinstance(pdf_output, str):
+        # Ensure we have proper bytes object
+        if isinstance(pdf_output, bytearray):
+            pdf_output = bytes(pdf_output)
+        elif isinstance(pdf_output, str):
             pdf_output = pdf_output.encode('latin-1')
 
-        if pdf_output is None:
+        if pdf_output is None or len(pdf_output) == 0:
             return jsonify({"error": "Failed to generate PDF output"}), 500
-
-        # Verify PDF has content
-        if pdf_output == b'':
-            return jsonify({"error": "Generated PDF is empty"}), 500
 
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"resource_{timestamp}.pdf"
 
-        # Upload to Firebase Storage
+        # Upload to Firebase Storage or provide local fallback
         try:
-            if use_secure_url:
-                download_url = upload_pdf_to_firebase_secure(pdf_output, filename)
+            if firebase_initialized:
+                if use_secure_url:
+                    download_url = upload_pdf_to_firebase_secure(
+                        pdf_output, filename)
+                else:
+                    download_url = upload_pdf_to_firebase(pdf_output, filename)
+
+                return jsonify({
+                    "success": True,
+                    "download_url": download_url,
+                    "filename": filename,
+                    "content_type": "application/pdf",
+                    "size": len(pdf_output),
+                    "secure_url": use_secure_url,
+                    "storage": "Firebase Storage"
+                })
             else:
-                download_url = upload_pdf_to_firebase(pdf_output, filename)
+                # Firebase not available, return PDF as base64 for download
+                pdf_base64 = base64.b64encode(pdf_output).decode('utf-8')
+
+                return jsonify({
+                    "success": True,
+                    "pdf_data": pdf_base64,
+                    "filename": filename,
+                    "content_type": "application/pdf",
+                    "size": len(pdf_output),
+                    "storage": "Local Generation",
+                    "message": "Firebase not available. PDF generated successfully."
+                })
+
         except Exception as e:
             return jsonify({"error": f"Failed to upload to Firebase: {str(e)}"}), 500
 
-        return jsonify({
-            "success": True,
-            "download_url": download_url,
-            "filename": filename,
-            "content_type": "application/pdf",
-            "size": len(pdf_output),
-            "secure_url": use_secure_url
-        })
-
     except Exception as e:
         return jsonify({"error": f"PDF generation failed: {str(e)}"}), 500
+
+
+@app.route('/')
+def index():
+    """Serve the HTML page"""
+    return send_file('index.html')
 
 
 @app.route('/health', methods=['GET'])
@@ -343,7 +418,8 @@ def generate_pdf_with_data():
         # Upload to Firebase Storage
         try:
             if use_secure_url:
-                download_url = upload_pdf_to_firebase_secure(pdf_output, filename)
+                download_url = upload_pdf_to_firebase_secure(
+                    pdf_output, filename)
             else:
                 download_url = upload_pdf_to_firebase(pdf_output, filename)
         except Exception as e:
